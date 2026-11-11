@@ -25,4 +25,5 @@ import TiffImages  # activates the EarthSciIOTiffImagesExt weakdep ext for the g
     include("zarr_write_test.jl")    # zarr v3 sharded WRITER round-trip (write -> read)
     include("test_provider.jl")      # cadence + the full offline pipeline; reuses helpers
     include("test_provider_cache.jl")  # the last-sample memo: on == off, bit for bit
+    include("test_nc_handles.jl")    # the netcdf reader's kept handles; reuses the above
 end

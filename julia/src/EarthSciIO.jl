@@ -158,6 +158,7 @@ end
 
 function __init__()
     _register_defaults()
+    atexit(_nc_close_all!)      # the netcdf reader's kept handles (readers.jl)
     return nothing
 end
 
