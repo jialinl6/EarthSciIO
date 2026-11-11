@@ -22,6 +22,15 @@ Temporal cadence of a provider's data (the `.esm` node's `temporal-cadence`):
     the solver refreshes at each tick."""
 @enum Cadence CONST DISCRETE
 
+# A provider's last sample and what it was read from (see `_memoized`). One per
+# provider, so the memory is exactly one bracket.
+mutable struct _SampleMemo
+    lock::ReentrantLock
+    key::Any                                  # (tick, select, blob identities)
+    value::Union{Nothing,NativeDataset}
+end
+_SampleMemo() = _SampleMemo(ReentrantLock(), nothing, nothing)
+
 """
     Provider(cache, url; format, cadence=CONST, times=Float64[], time_dim=nothing,
              variables=nothing, reader_kwargs=NamedTuple(),
@@ -65,7 +74,11 @@ A data provider over the shared cache.
     `nothing` returns all.
   * `reader_kwargs` — extra keywords forwarded to [`read_native`] (e.g. the CSV
     reader's `numeric_columns`).
-  * `source_loader` / `auth_realm` — recorded in the cache manifest on fetch."""
+  * `source_loader` / `auth_realm` — recorded in the cache manifest on fetch.
+
+A provider with a `time_dim` keeps the last sample it returned and returns it
+again, unread, while the tick, the `select` and the source blob are unchanged —
+see [`materialize`]. Treat every returned dataset as read-only."""
 struct Provider
     cache::Cache
     format::String
@@ -78,6 +91,7 @@ struct Provider
     source_loader::Union{Nothing,String}
     auth_realm::Union{Nothing,String}
     records_per_sample::Union{Nothing,Int}
+    memo::_SampleMemo
 end
 
 function Provider(cache::Cache, url; format::AbstractString,
@@ -135,7 +149,8 @@ function Provider(cache::Cache, url; format::AbstractString,
                     kw,
                     source_loader === nothing ? nothing : String(source_loader),
                     auth_realm === nothing ? nothing : String(auth_realm),
-                    records_per_sample === nothing ? nothing : Int(records_per_sample))
+                    records_per_sample === nothing ? nothing : Int(records_per_sample),
+                    _SampleMemo())
 end
 
 # The loader's declared decode options, checked against the bound reader AT
@@ -191,7 +206,10 @@ _reader_for(p::Provider) = FORMAT_REGISTRY[p.format]
 # by materialising only the requested hyperslab of the blob it already fetched.
 # A `select` handed to a reader that does neither is a clear error, raised BEFORE
 # any fetch (the fetch-full fallback belongs to the EarthSciAST caller, not here).
-function _load(p::Provider, t; select = nothing, records = nothing)
+#
+# `fetched` (url => CacheEntry) carries blobs the caller already fetched, so a
+# sample `_memoized` had to resolve to build its key is not fetched twice.
+function _load(p::Provider, t; select = nothing, records = nothing, fetched = nothing)
     reader = _reader_for(p)
     # Store-backed readers (e.g. zarr) are handed (cache, base_url; variables,
     # select): a Zarr `url` is a directory-like prefix, not a fetchable blob, so
@@ -216,8 +234,11 @@ function _load(p::Provider, t; select = nothing, records = nothing)
     effective = select === nothing ? get(p.reader_kwargs, :select, nothing) : select
     effective === nothing || supports_selection(reader) || throw(ArgumentError(
         "reader $(typeof(reader)) does not support select/pushdown"))
-    entry = fetch_blob(p.cache, p.url_for(t);
-                       source_loader = p.source_loader, auth_realm = p.auth_realm)
+    url = p.url_for(t)
+    entry = fetched === nothing ? nothing : get(fetched, url, nothing)
+    entry === nothing && (entry = fetch_blob(p.cache, url;
+                                             source_loader = p.source_loader,
+                                             auth_realm = p.auth_realm))
     # PROJECTION PUSHDOWN for a whole-file reader that declares a `variables`
     # decode option (the `parquet` reader): the loader's `variables` reach the
     # READER, so only those column chunks come off disk — spec/conformance.md §3
@@ -356,11 +377,12 @@ end
 # A reader that takes no `records` option falls back to the historical path:
 # decode the axis whole, return the record indices to slice at. The two paths
 # differ in what is DECODED and in nothing else.
-function _load_ticks(p::Provider, ticks::AbstractVector{<:Integer}; select = nothing)
+function _load_ticks(p::Provider, ticks::AbstractVector{<:Integer}; select = nothing,
+                     fetched = nothing)
     dim = p.time_dim::String
     t_url = p.times[first(ticks)]
     if !_records_pushdown(p)
-        nds = _load(p, t_url; select = select)
+        nds = _load(p, t_url; select = select, fetched = fetched)
         len = _time_len(nds, dim)
         return (nds, Int[_file_record(tk, len) for tk in ticks])
     end
@@ -375,7 +397,7 @@ function _load_ticks(p::Provider, ticks::AbstractVector{<:Integer}; select = not
         fired[] = true
         return Int[_file_record(tk, Int(len)) - 1 for tk in ticks]   # 0-based
     end
-    nds = _load(p, t_url; select = select,
+    nds = _load(p, t_url; select = select, fetched = fetched,
                 records = Dict{String,Any}("dim" => dim, "indices" => resolve))
     # The resolver is not called when the blob has no such dimension. That is the
     # `len <= 0` case of `_file_record`, and it must behave exactly as it always
@@ -509,7 +531,7 @@ function _bracket_build(nds0::NativeDataset, i0::Integer,
     return NativeDataset(vars, coords)
 end
 
-function _bracket(p::Provider, t::Real; select = nothing)
+function _bracket(p::Provider, t::Real; select = nothing, fetched = nothing)
     dim  = p.time_dim::String
     tick = _tick_index(p, t)                 # floor tick on the GLOBAL cadence
     # Resolve the URL at the TICK time, not at the query time `t`: the record we
@@ -525,7 +547,7 @@ function _bracket(p::Provider, t::Real; select = nothing)
     # for the floor record alone — the successor is either absent (it degenerates
     # to the floor) or in the next file, read below.
     ticks0 = same_file ? Int[tick, tick + 1] : Int[tick]
-    nds0, pos0 = _load_ticks(p, ticks0; select = select)
+    nds0, pos0 = _load_ticks(p, ticks0; select = select, fetched = fetched)
     scale = _cf_time_scale(_time_units(nds0, dim))
     t0 = _raw_to_epoch(p.times[tick], scale)
 
@@ -539,7 +561,7 @@ function _bracket(p::Provider, t::Real; select = nothing)
     end
     # Successor: record 1 of the NEXT file, re-decoded because the provider keeps
     # no file buffer (and, with the pushdown, one record of it rather than all).
-    nds1, pos1 = _load_ticks(p, Int[tick + 1]; select = select)
+    nds1, pos1 = _load_ticks(p, Int[tick + 1]; select = select, fetched = fetched)
     return _bracket_build(nds0, pos0[1], nds1, pos1[1], dim, t0, t1)
 end
 
@@ -562,19 +584,102 @@ OVERRIDES any baked `reader_kwargs[:select]` for this call only, letting a calle
 provider. Any reader that answers [`supports_selection`] can honour it — the
 `zarr` reader by fetching only the intersecting chunk objects, the `netcdf` one by
 materialising only the requested hyperslab of the blob it already fetched;
-passing `select` to a reader that cannot is an `ArgumentError`."""
+passing `select` to a reader that cannot is an `ArgumentError`.
+
+**The result is shared: treat it as read-only.** A provider with a `time_dim`
+over a whole-file reader keeps the last sample it returned, keyed by the cadence
+tick `t` falls in, the effective `select` (per-call, else baked) and the identity
+of every source blob the sample decodes (path, inode, size and mtime, from
+`stat`). The same key again returns that very `NativeDataset` — the same dicts,
+fields and arrays — without reading anything, so a caller that modifies one must
+copy it first. Any change of key reads afresh: another tick (forward or
+backward), another `select`, or a blob that was re-fetched, rewritten or touched.
+A blob modified within the last 2 s is not kept, because a filesystem with
+whole-second mtimes cannot yet tell its next rewrite apart (git's racy-timestamp
+rule). `EARTHSCIIO_PROVIDER_CACHE=0` (or `false`/`no`/`off`) turns this off; it is
+read on every call."""
 function materialize(p::Provider, t::Real; select = nothing)
+    _memo_applies(p) && return _memoized(p, t, select)
+    return _materialize(p, t; select = select)
+end
+
+function _materialize(p::Provider, t::Real; select = nothing, fetched = nothing)
     if p.records_per_sample == 2 && p.time_dim !== nothing
-        return _bracket(p, t; select = select)
+        return _bracket(p, t; select = select, fetched = fetched)
     end
     if p.time_dim !== nothing
         tick = _tick_index(p, t)
         # The TICK's file (see `_bracket`), and — where the reader takes a
         # `records` pushdown — only the tick's record out of it.
-        nds, pos = _load_ticks(p, Int[tick]; select = select)
+        nds, pos = _load_ticks(p, Int[tick]; select = select, fetched = fetched)
         return _slice_dim(nds, p.time_dim, pos[1])
     end
     return _load(p, t; select = select)
+end
+
+# --- last-sample memo -------------------------------------------------------
+# A model samples every provider at every forcing boundary, but a provider's data
+# changes only when the boundary crosses one of ITS ticks. Measured on reseact.esm
+# (CONUS 4x5, one day, 18 GEOS-FP providers, 32 boundaries a day): 632 samples,
+# each opening and decoding its daily file, 22.9 s of forcing a day; returning
+# the previous sample whenever the tick has not moved leaves 300 reads and 9.2 s,
+# bit-identical. Re-reading only the successor record when the tick does move
+# was measured too and saves nothing — the cost is per open, not per record — so
+# the memo holds exactly the last sample and nothing else.
+#
+# The key is the TICK rather than `t`, so every `t` in one cadence interval
+# hits, and it works in either time direction (an adjoint replays the forcing
+# backwards). The tick, the `select` and the bytes of the blobs fix the sample:
+# every other input (`variables`, `records_per_sample`, `reader_kwargs`) is fixed
+# when the provider is built. The blobs are still resolved through `fetch_blob`
+# on every call, so TTL expiry and the `file://` recheck decide what the bytes
+# are exactly as they always did, and a blob they replace has a new identity.
+#
+# Store-backed readers are excluded: a zarr sample is many objects, not one blob
+# with one identity.
+_memo_applies(p::Provider) =
+    p.time_dim !== nothing && !store_backed(_reader_for(p)) && _provider_cache_enabled()
+
+# On unless an explicit denial, the spelling `EARTHSCI_REVALIDATE_FILE` takes.
+function _provider_cache_enabled()
+    v = lowercase(strip(get(ENV, "EARTHSCIIO_PROVIDER_CACHE", "")))
+    return !(v in ("0", "false", "no", "off"))
+end
+
+# The URLs of the blobs a sample at cadence tick `tick` decodes: the tick's own
+# file, and the next tick's when a bracket's successor lies across a file seam —
+# the rule `_bracket` applies, so the key covers every blob the sample reads.
+function _sample_urls(p::Provider, tick::Int)
+    u0 = String(p.url_for(p.times[tick]))
+    (p.records_per_sample == 2 && tick < length(p.times)) || return String[u0]
+    u1 = String(p.url_for(p.times[tick + 1]))
+    return u1 == u0 ? String[u0] : String[u0, u1]
+end
+
+function _memoized(p::Provider, t::Real, select)
+    tick = _tick_index(p, t)
+    urls = _sample_urls(p, tick)
+    fetched = Dict{String,CacheEntry}(
+        u => fetch_blob(p.cache, u; source_loader = p.source_loader,
+                        auth_realm = p.auth_realm) for u in urls)
+    idents = [_file_identity(fetched[u].path) for u in urls]
+    effective = select === nothing ? get(p.reader_kwargs, :select, nothing) : select
+    key = (tick, effective, idents)
+    m = p.memo
+    # Held across the read, so two tasks sampling one provider cannot interleave
+    # a key with another sample's value.
+    return lock(m.lock) do
+        m.value !== nothing && isequal(m.key, key) && return m.value
+        nds = _materialize(p, t; select = select, fetched = fetched)
+        if any(isnothing, idents)                # a blob that cannot vouch for itself
+            m.key, m.value = nothing, nothing
+        else
+            # A copy of `select`, so a caller that reuses and edits its Dict
+            # cannot edit the key behind the memo's back.
+            m.key, m.value = (tick, deepcopy(effective), idents), nds
+        end
+        return nds
+    end
 end
 
 function materialize(p::Provider; select = nothing)

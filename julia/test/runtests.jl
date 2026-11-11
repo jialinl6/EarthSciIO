@@ -24,4 +24,5 @@ import TiffImages  # activates the EarthSciIOTiffImagesExt weakdep ext for the g
     include("test_zarr.jl")          # store-backed zarr reader: lazy orthogonal selection
     include("zarr_write_test.jl")    # zarr v3 sharded WRITER round-trip (write -> read)
     include("test_provider.jl")      # cadence + the full offline pipeline; reuses helpers
+    include("test_provider_cache.jl")  # the last-sample memo: on == off, bit for bit
 end
