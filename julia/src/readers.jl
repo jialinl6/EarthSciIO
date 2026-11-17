@@ -186,7 +186,15 @@ A two-argument callable `(len, axis) -> indices` is also handed `dim`'s own
 coordinate, read raw with its `units`, `calendar`, `_FillValue`,
 `missing_value`, `scale_factor` and `add_offset` (a `NativeField`, or `nothing`
 when the blob has no such variable), so the [`Provider`] can find its record by the file's own time axis
-(spec/esm-sources.md §2.5) in the same open."""
+(spec/esm-sources.md §2.5) in the same open.
+
+A file in the content-addressed cache (`<root>/v1/blobs/<k[1:2]>/<k>[.ext]`) is
+kept OPEN between calls, in an LRU of `EARTHSCIIO_NC_HANDLES` handles (default
+32, or 0 on Windows; `0` turns it off). A kept handle is reused only while the
+file's `stat` (inode, size, mtime) still matches the one taken when it was opened.
+A file modified within the last 2 s is never kept. Handles are closed on eviction
+and at exit. Any other path is opened and closed on every call: a netCDF-4 file
+this process holds open cannot be reopened by it for writing."""
 struct NetCDFReader <: Reader end
 
 # Widened capability (spec/registries.md §2): "honours `select` without
@@ -219,10 +227,190 @@ end
 # measurement rather than assumed.
 const _NETCDF_LOCK = ReentrantLock()
 
-_with_netcdf(f, path::String) =
-    lock(_NETCDF_LOCK) do
-    NCDatasets.NCDataset(f, path, "r")
+# Run `f(ds)` on a read-only NCDataset of `path`, under `_NETCDF_LOCK`: a kept
+# handle where the open-file cache applies, else one opened and closed around the
+# call, as every read used to be.
+function _with_netcdf(f, path::String)
+    return lock(_NETCDF_LOCK) do
+        cap = _nc_handle_capacity()
+        h = nothing
+        if cap == 0
+            _nc_close_all!()             # anything kept before the cache was turned off
+        elseif _nc_keepable(path)
+            h = _nc_acquire!(path, cap)
+        end
+        if h === nothing
+            Threads.atomic_add!(_NC_OPENS, 1)
+            return NCDatasets.NCDataset(f, path, "r")
+        end
+        ok = false
+        try
+            r = lock(() -> f(h.ds), h.lock)
+            ok = true
+            return r
+        finally
+            _nc_release!(h, ok)
+        end
+    end
 end
+
+# --- open-file cache --------------------------------------------------------
+# Opening a netCDF file costs more than reading a two-record bracket out of it.
+# Measured on reseact.esm (CONUS 4x5, one day, 18 GEOS-FP providers): with the
+# Provider's last-sample memo the forcing still opened its 10 daily files 300
+# times, 9.2 s a day; keeping one open NCDataset per file makes that 10 opens and
+# 5.5 s (the solver loop -13 %), bit-identical. Reading the records one call at a
+# time instead saved nothing, so the cost is the open, and the open is what this
+# keeps.
+#
+# Which files may be kept: only content-addressed cache blobs. A blob is written
+# once and replaced only by rename(2) (`put_blob!`), so nobody opens one for
+# writing. Any other path might be, and HDF5 will not reopen a netCDF-4 file for
+# writing in a process that holds it open read-only (measured, NCDatasets 0.14.15:
+# "a" fails with an HDF error, "c" with EACCES), so keeping every path open would
+# break a read-then-rewrite of the same file.
+#
+# A kept handle is valid while `_file_identity` (path, device, inode, size,
+# mtime) is unchanged; a file inside the racy margin is opened and closed as
+# before. Every open, read and close of a kept handle happens under
+# `_NETCDF_LOCK`, like any other NetCDF-C call, so today the reads are serialised
+# by that lock; the cache's own locks (one for its state, one per handle) keep it
+# correct on their own should that lock go (spec/prefetch.md §5, item 3), when
+# reads of one file would take turns on its handle and reads of different files
+# would not wait on each other. A handle that leaves the cache (evicted,
+# invalidated, or after a failed read) is closed once the last read using it has
+# finished.
+
+mutable struct _NCHandle
+    const path::String
+    const ident::Any
+    const ds::NCDatasets.NCDataset
+    const lock::ReentrantLock          # one decode at a time on this handle
+    users::Int                         # reads in progress; under _NC_HANDLES_LOCK
+    retired::Bool                      # out of the cache; closed when users == 0
+end
+
+const _NC_HANDLES = Dict{String, _NCHandle}()
+const _NC_LRU = String[]               # kept paths, least recently used first
+const _NC_HANDLES_LOCK = ReentrantLock()
+const _NC_OPENS = Threads.Atomic{Int}(0)   # every open, kept or not
+const _NC_LIVE = Threads.Atomic{Int}(0)    # handles the cache opened and has not closed
+
+# Not on Windows by default: a file held open there cannot be renamed over, and a
+# rename is how the cache commits a re-fetched blob.
+const NC_HANDLES_DEFAULT = Sys.iswindows() ? 0 : 32
+
+# `EARTHSCIIO_NC_HANDLES`, read on every call so it can be changed at run time.
+function _nc_handle_capacity()
+    v = strip(get(ENV, "EARTHSCIIO_NC_HANDLES", ""))
+    isempty(v) && return NC_HANDLES_DEFAULT
+    n = tryparse(Int, v)
+    (n === nothing || n < 0) && throw(
+        ArgumentError(
+            "EARTHSCIIO_NC_HANDLES must be a non-negative integer (0 turns the open-file " *
+                "cache off), got $(repr(v))"
+        )
+    )
+    return n
+end
+
+# Is `path` a content-addressed cache blob, `.../v1/blobs/<k[1:2]>/<k>[.ext]`?
+function _nc_keepable(path::String)
+    name = basename(path)
+    dot = findfirst('.', name)
+    key = dot === nothing ? name : name[1:prevind(name, dot)]
+    (length(key) == 64 && all(c -> isdigit(c) || 'a' <= c <= 'f', key)) || return false
+    shard = dirname(path)
+    basename(shard) == key[1:2] || return false
+    blobs = dirname(shard)
+    return basename(blobs) == "blobs" && basename(dirname(blobs)) == CACHE_VERSION
+end
+
+# A kept handle for `path` with one more user, opening it if need be; `nothing`
+# when the file cannot vouch for its bytes (see `_file_identity`). The `stat` is
+# taken BEFORE the open, so a change racing the open leaves a handle whose
+# recorded identity is older than its bytes: the next call sees the difference
+# and reopens, rather than trusting a handle to bytes it never checked.
+function _nc_acquire!(path::String, cap::Int)
+    ident = _file_identity(path)
+    return lock(_NC_HANDLES_LOCK) do
+        h = get(_NC_HANDLES, path, nothing)
+        if h !== nothing && ident !== nothing && isequal(h.ident, ident)
+            h.users += 1
+            _nc_touch!(path)
+            _nc_trim!(cap)
+            return h
+        end
+        h === nothing || _nc_retire!(h)          # the file changed under it
+        ident === nothing && return nothing
+        ds = NCDatasets.NCDataset(path, "r")
+        Threads.atomic_add!(_NC_OPENS, 1)
+        Threads.atomic_add!(_NC_LIVE, 1)
+        h = _NCHandle(path, ident, ds, ReentrantLock(), 1, false)
+        _NC_HANDLES[path] = h
+        push!(_NC_LRU, path)
+        _nc_trim!(cap)
+        return h
+    end
+end
+
+# A read on `h` is done. One that failed takes the handle out of the cache — it
+# costs one reopen, and an error never leaves behind a handle in an unknown state.
+function _nc_release!(h::_NCHandle, ok::Bool)
+    lock(_NC_HANDLES_LOCK) do
+        h.users -= 1
+        if !h.retired && !ok
+            _nc_retire!(h)
+        elseif h.retired && h.users == 0
+            _nc_close!(h)
+        end
+    end
+    return nothing
+end
+
+# The rest run under _NC_HANDLES_LOCK.
+function _nc_touch!(path::String)
+    i = findfirst(==(path), _NC_LRU)
+    i === nothing || deleteat!(_NC_LRU, i)
+    push!(_NC_LRU, path)
+    return nothing
+end
+
+function _nc_trim!(cap::Int)
+    while length(_NC_LRU) > cap
+        _nc_retire!(_NC_HANDLES[first(_NC_LRU)])
+    end
+    return nothing
+end
+
+# Out of the cache now; closed now if nobody is reading it, else by its last reader.
+function _nc_retire!(h::_NCHandle)
+    h.retired && return nothing
+    h.retired = true
+    delete!(_NC_HANDLES, h.path)
+    filter!(!=(h.path), _NC_LRU)
+    h.users == 0 && _nc_close!(h)
+    return nothing
+end
+
+function _nc_close!(h::_NCHandle)
+    Threads.atomic_sub!(_NC_LIVE, 1)
+    try
+        close(h.ds)
+    catch err
+        @warn "closing a cached netCDF handle failed" path = h.path exception = err
+    end
+    return nothing
+end
+
+# Close every kept handle (`atexit`, and on turning the cache off). A close is a
+# NetCDF-C call, so it takes `_NETCDF_LOCK` first, as every other one does.
+_nc_close_all!() = lock(_NETCDF_LOCK) do
+    lock(() -> _nc_trim!(0), _NC_HANDLES_LOCK)
+end
+
+# The kept paths, least recently used first.
+_nc_held() = lock(() -> copy(_NC_LRU), _NC_HANDLES_LOCK)
 
 # A CF time axis is one whose `units` is "<step> since <reference>" (hours since
 # …, days since …). Matching xarray `decode_times=false`, such variables are

@@ -17,6 +17,14 @@ package version is independent of the `.esm` format version.
   22.9 s to 9.2 s, bit-identical. The returned dataset is shared, so treat it as
   read-only. A blob modified within the last 2 s is not kept. On by default;
   `EARTHSCIIO_PROVIDER_CACHE=0` turns it off.
+- **perf:** the netcdf reader keeps cache blobs open between reads, in an LRU of
+  `EARTHSCIIO_NC_HANDLES` handles (default 32, or 0 on Windows; `0` turns it
+  off). A handle is reused while the file's inode, size and mtime are unchanged,
+  and closed on eviction and at exit; every open, read and close still runs
+  under the process-wide NetCDF lock. With the Provider cache above, the same
+  day goes from 300 opens to 10 and forcing from 9.2 s to 5.5 s, bit-identical.
+  Files outside the cache are still opened per read, because HDF5 will not let a
+  process reopen for writing a netCDF-4 file it holds open.
 
 ## v0.4.0
 

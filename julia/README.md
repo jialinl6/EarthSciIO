@@ -101,6 +101,7 @@ anything read from a file modified within the last 2 s.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `EARTHSCIIO_PROVIDER_CACHE` | on | a Provider with a `time_dim` returns its last sample unread while the record (cadence tick or record anchor), the effective `select` and the source blobs (path, inode, size, mtime) are unchanged; `0`/`false`/`no`/`off` turns it off |
+| `EARTHSCIIO_NC_HANDLES` | `32` (`0` on Windows) | how many cache blobs the netcdf reader keeps open between reads, reopening any whose inode, size or mtime changed and closing them on eviction and at exit; `0` turns it off. Files outside the cache are opened per read, so they can still be rewritten in place |
 
 A sample from the Provider's cache is the same object it returned before, so
 treat a returned dataset as read-only and copy it before modifying it.
