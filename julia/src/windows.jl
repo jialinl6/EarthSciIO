@@ -184,13 +184,13 @@ function _check_window(p::Provider, sel::Dict{String, Any})
 end
 
 # `p` with `reader_kwargs` replaced — sharing its cache, reader, resolver and
-# cadence. Bypasses the constructor's checks, which `p` already passed and which a
-# `select` cannot change.
+# cadence, but with a last-sample memo of its own. Bypasses the constructor's
+# checks, which `p` already passed and which a `select` cannot change.
 _with_reader_kwargs(p::Provider, kw::Dict{Symbol, Any}) =
     Provider(
     p.cache, p.format, p.cadence, p.times, p.url_for, p.time_dim,
     p.variables, kw, p.source_loader, p.auth_realm, p.records_per_sample,
-    p.mirrors_for, p.plan
+    p.mirrors_for, p.plan, _SampleMemo()
 )
 
 function _with_select(p::Provider, sel::Dict{String, Any})

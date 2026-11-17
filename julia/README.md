@@ -92,6 +92,19 @@ A retry restarts the transfer at byte zero (no `Range` resume), so a blob that
 needs more than `EARTHSCIIO_HTTP_TIMEOUT` seconds is downloaded more than once;
 raise `EARTHSCIIO_HTTP_TIMEOUT` for a workload that is known to be large.
 
+### Read caches
+
+A model samples every provider at every forcing boundary; these keep that from
+re-reading what has not changed. Both are read on every call, and neither keeps
+anything read from a file modified within the last 2 s.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `EARTHSCIIO_PROVIDER_CACHE` | on | a Provider with a `time_dim` returns its last sample unread while the record (cadence tick or record anchor), the effective `select` and the source blobs (path, inode, size, mtime) are unchanged; `0`/`false`/`no`/`off` turns it off |
+
+A sample from the Provider's cache is the same object it returned before, so
+treat a returned dataset as read-only and copy it before modifying it.
+
 ## Tests
 
 ```bash

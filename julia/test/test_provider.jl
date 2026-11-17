@@ -271,7 +271,11 @@ end
             @test b["t2m"].data[1, 1, 1] == b["t2m"].data[2, 1, 1]
             @test b["time"].data[1] == b["time"].data[2]
             empty!(RECORDS_PUSHED)
-            past = materialize(spy2, 9.0)           # past the end clamps the same way
+            # Past the end is the same tick as 3.0, which the last-sample memo
+            # answers without reading; this pins the READ, so it asks with it off.
+            past = withenv("EARTHSCIIO_PROVIDER_CACHE" => "0") do
+                materialize(spy2, 9.0)              # past the end clamps the same way
+            end
             @test RECORDS_PUSHED == [rec([1])]
             @test same_native(past, materialize(ref2, 9.0))
         end

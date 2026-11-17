@@ -304,6 +304,28 @@ question answered."""
 file_source_is_current(source::AbstractString, m::Manifest) =
     file_source_state(source, m) === SOURCE_CURRENT
 
+# The identity of the file at `path` for a read-side cache that keeps what it got
+# from it (the Provider's last sample, the netcdf reader's open handles):
+# `(path, device, inode, size, mtime)` from one `stat`, or `nothing` when that stat
+# cannot vouch for the bytes and nothing may be kept — no regular file there, or
+# an mtime within `SOURCE_RACY_MARGIN` of now (or ahead of it). That is the
+# racy-timestamp rule `source_state` follows, for the same reason: a same-size
+# rewrite inside one mtime tick keeps `(size, mtime)`. Once the mtime is safely
+# past, an in-place write moves it and a rename over the path (how the cache
+# commits a blob) changes the inode. What it can still miss is a same-size
+# rewrite that then puts the old mtime back.
+function _file_identity(path::AbstractString)
+    st = try
+        stat(path)
+    catch
+        return nothing
+    end
+    isfile(st) || return nothing
+    mt = Float64(st.mtime)
+    mt < time() - SOURCE_RACY_MARGIN || return nothing
+    return (String(path), UInt64(st.device), UInt64(st.inode), Int64(st.size), mt)
+end
+
 # --- Cache ------------------------------------------------------------------
 
 """

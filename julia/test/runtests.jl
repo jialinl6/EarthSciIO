@@ -30,6 +30,7 @@ import TiffImages  # activates the EarthSciIOTiffImagesExt weakdep ext for the g
     include("zarr_write_test.jl")    # zarr v3 sharded WRITER round-trip (write -> read)
     include("test_zarr_stream.jl")   # the streaming writer contract (spec/writer.md, RFC U12)
     include("test_provider.jl")      # cadence + the full offline pipeline; reuses helpers
+    include("test_provider_cache.jl")  # the last-sample memo: on == off, bit for bit
     include("test_esm.jl")           # esm URL templates + mirror failover (spec/esm-sources.md)
     include("test_calendar.jl")      # calendar cadences + the temporal Provider (spec/esm-sources.md §2)
     include("test_esm_source.jl")    # provider_from_esm (spec/esm-sources.md §3)

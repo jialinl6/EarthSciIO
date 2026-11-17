@@ -22,6 +22,15 @@ Temporal cadence of a provider's data (the `.esm` node's `temporal-cadence`):
     the solver refreshes at each tick."""
 @enum Cadence CONST DISCRETE
 
+# A provider's last sample and what it was read from (see `_memoized`). One per
+# provider, so the memory is exactly one sample.
+mutable struct _SampleMemo
+    lock::ReentrantLock
+    key::Any                  # (record, plan, select, reader, blob identities)
+    value::Union{Nothing, NativeDataset}
+end
+_SampleMemo() = _SampleMemo(ReentrantLock(), nothing, nothing)
+
 """
     Provider(cache, url; format, cadence=CONST, times=Float64[], time_dim=nothing,
              variables=nothing, reader_kwargs=NamedTuple(),
@@ -94,7 +103,11 @@ A data provider over the shared cache.
     blob is still cached under the primary URL's key. With an
     [`EsmTemplate`](@ref) `url`, leave this empty and give the mirrors to the
     template: they are esm templates expanded at the same anchor
-    (spec/esm-sources.md §1.5)."""
+    (spec/esm-sources.md §1.5).
+
+A provider with a `time_dim` keeps the last sample it returned and returns it
+again, unread, while the record, the `select` and the source blobs are
+unchanged — see [`materialize`]. Treat every returned dataset as read-only."""
 struct Provider
     cache::Cache
     format::String
@@ -109,6 +122,7 @@ struct Provider
     records_per_sample::Union{Nothing, Int}
     mirrors_for::Function
     plan::Any                     # `nothing`, or the `_TemporalPlan` of a `temporal` provider
+    memo::_SampleMemo             # the last sample (`_memoized`); never shared
 end
 
 # The clock of a `temporal` provider (spec/esm-sources.md §4): the time origin
@@ -468,16 +482,30 @@ function Provider(
         source_loader === nothing ? nothing : String(source_loader),
         auth_realm === nothing ? nothing : String(auth_realm),
         records_per_sample === nothing ? nothing : Int(records_per_sample),
-        mirrors_for, plan
+        mirrors_for, plan, _SampleMemo()
     )
 end
 
 # Fetch (or reuse) the blob of the file for time `t`, with its mirrors.
-_fetch_at(p::Provider, t) = fetch_blob(
-    p.cache, p.url_for(t);
-    source_loader = p.source_loader, auth_realm = p.auth_realm,
-    mirrors = p.mirrors_for(t)
-)
+#
+# `fetched` (url => CacheEntry, or the exception its fetch raised) carries what
+# `_memoized` already fetched to build its key, so a sample does not fetch a blob
+# twice: an entry is reused, and a failed fetch is raised again rather than retried.
+function _fetch_at(p::Provider, t; fetched = nothing)
+    if fetched !== nothing
+        u = String(p.url_for(t))
+        if haskey(fetched, u)
+            got = fetched[u]
+            got isa CacheEntry && return got
+            throw(got)
+        end
+    end
+    return fetch_blob(
+        p.cache, p.url_for(t);
+        source_loader = p.source_loader, auth_realm = p.auth_realm,
+        mirrors = p.mirrors_for(t)
+    )
+end
 
 # The loader's declared decode options, checked against the bound reader AT
 # CONSTRUCTION (spec/registries.md §2.1). An unrecognised option is an ERROR
@@ -578,7 +606,9 @@ _reader_for(p::Provider) = FORMAT_REGISTRY[p.format]
 # by materialising only the requested hyperslab of the blob it already fetched.
 # A `select` handed to a reader that does neither is a clear error, raised BEFORE
 # any fetch (the fetch-full fallback belongs to the EarthSciAST caller, not here).
-function _load(p::Provider, t; select = nothing, records = nothing)
+#
+# `fetched` is handed to `_fetch_at`: blobs `_memoized` already resolved.
+function _load(p::Provider, t; select = nothing, records = nothing, fetched = nothing)
     reader = _reader_for(p)
     # Store-backed readers (e.g. zarr) are handed (cache, base_url; variables,
     # select): a Zarr `url` is a directory-like prefix, not a fetchable blob, so
@@ -611,7 +641,7 @@ function _load(p::Provider, t; select = nothing, records = nothing)
             "reader $(typeof(reader)) does not support select/pushdown"
         )
     )
-    entry = _fetch_at(p, t)
+    entry = _fetch_at(p, t; fetched = fetched)
     # PROJECTION PUSHDOWN for a whole-file reader that declares a `variables`
     # decode option (the `parquet` reader): the loader's `variables` reach the
     # READER, so only those column chunks come off disk — spec/conformance.md §3
@@ -758,10 +788,12 @@ end
 # A reader that takes no `records` option falls back to the historical path:
 # decode the axis whole, return the record indices to slice at. The two paths
 # differ in what is DECODED and in nothing else.
-function _load_ticks(p::Provider, ticks::AbstractVector{<:Integer}; select = nothing)
+function _load_ticks(
+        p::Provider, ticks::AbstractVector{<:Integer}; select = nothing, fetched = nothing
+    )
     return _load_records(
         p, p.times[first(ticks)], len -> Int[_file_record(tk, len) for tk in ticks];
-        select = select
+        select = select, fetched = fetched
     )
 end
 
@@ -770,10 +802,10 @@ end
 # return `(nds, positions)` — `positions[k]` is where `recs(len)[k]` sits along
 # `time_dim` in `nds`. `_load_ticks` and a `temporal` provider's calendar
 # sampling both read through here; only how the records are chosen differs.
-function _load_records(p::Provider, t_url, recs; select = nothing)
+function _load_records(p::Provider, t_url, recs; select = nothing, fetched = nothing)
     dim = p.time_dim::String
     if !_records_pushdown(p)
-        nds = _load(p, t_url; select = select)
+        nds = _load(p, t_url; select = select, fetched = fetched)
         return (nds, recs(_time_len(nds, dim)))
     end
     # The record a tick names is `mod1(tick, len)`, so the pushdown needs the
@@ -791,7 +823,7 @@ function _load_records(p::Provider, t_url, recs; select = nothing)
         return Int[r - 1 for r in want]   # 0-based
     end
     nds = _load(
-        p, t_url; select = select,
+        p, t_url; select = select, fetched = fetched,
         records = Dict{String, Any}("dim" => dim, "indices" => resolve)
     )
     # The resolver is not called when the blob has no such dimension. That is the
@@ -919,7 +951,7 @@ function _bracket_build(
     return NativeDataset(vars, coords)
 end
 
-function _bracket(p::Provider, t::Real; select = nothing)
+function _bracket(p::Provider, t::Real; select = nothing, fetched = nothing)
     dim = p.time_dim::String
     tick = _tick_index(p, t)                 # floor tick on the GLOBAL cadence
     # Resolve the URL at the TICK time, not at the query time `t`: the record we
@@ -935,7 +967,7 @@ function _bracket(p::Provider, t::Real; select = nothing)
     # for the floor record alone — the successor is either absent (it degenerates
     # to the floor) or in the next file, read below.
     ticks0 = same_file ? Int[tick, tick + 1] : Int[tick]
-    nds0, pos0 = _load_ticks(p, ticks0; select = select)
+    nds0, pos0 = _load_ticks(p, ticks0; select = select, fetched = fetched)
     scale = _cf_time_scale(_time_units(nds0, dim))
     t0 = _raw_to_epoch(p.times[tick], scale)
 
@@ -949,7 +981,7 @@ function _bracket(p::Provider, t::Real; select = nothing)
     end
     # Successor: record 1 of the NEXT file, re-decoded because the provider keeps
     # no file buffer (and, with the pushdown, one record of it rather than all).
-    nds1, pos1 = _load_ticks(p, Int[tick + 1]; select = select)
+    nds1, pos1 = _load_ticks(p, Int[tick + 1]; select = select, fetched = fetched)
     return _bracket_build(nds0, pos0[1], nds1, pos1[1], dim, t0, t1)
 end
 
@@ -1007,14 +1039,16 @@ end
 # record sits along `time_dim` in `nds`. With a reader that takes a `records`
 # pushdown, `choose` runs inside the reader's one open and only the chosen
 # records are decoded; the axis is read there too, unless this file's is cached.
-function _load_located(p::Provider, fa::DateTime, anchor::DateTime, choose; select = nothing)
+function _load_located(
+        p::Provider, fa::DateTime, anchor::DateTime, choose; select = nothing, fetched = nothing
+    )
     plan = p.plan::_TemporalPlan
     dim = p.time_dim::String
     t_url = _tick(plan, anchor)
     cached, times = _axis_cached(plan, fa)
     decode(axis) = _axis_store!(plan, fa, axis === nothing ? nothing : decode_time_axis(axis))
     if !_records_pushdown(p)
-        nds = _load(p, t_url; select = select)
+        nds = _load(p, t_url; select = select, fetched = fetched)
         cached || (times = decode(get(nds.coords, dim, nothing)))
         idx = choose(_time_len(nds, dim), times)
         return (nds, Int[i + 1 for i in idx])
@@ -1031,7 +1065,7 @@ function _load_located(p::Provider, fa::DateTime, anchor::DateTime, choose; sele
     resolve = cached ? (len::Integer -> pick(len, times)) :
         ((len::Integer, axis) -> pick(len, decode(axis)))
     nds = _load(
-        p, t_url; select = select,
+        p, t_url; select = select, fetched = fetched,
         records = Dict{String, Any}("dim" => dim, "indices" => resolve)
     )
     fired[] && return (nds, collect(1:n[]))
@@ -1043,7 +1077,7 @@ end
 # so the reader stops before decoding anything; the bracket then holds.
 struct _NoSuccessor <: Exception end
 
-function _temporal_sample(p::Provider, t::Real; select = nothing)
+function _temporal_sample(p::Provider, t::Real; select = nothing, fetched = nothing)
     plan = p.plan::_TemporalPlan
     temporal = plan.temporal
     dim = p.time_dim::String
@@ -1057,7 +1091,7 @@ function _temporal_sample(p::Provider, t::Real; select = nothing)
                 _calendar_record(r, len, dim);
                 Int[r]
             );
-            select = select
+            select = select, fetched = fetched
         )
         return _slice_dim(nds, dim, pos[1])
     end
@@ -1083,7 +1117,7 @@ function _temporal_sample(p::Provider, t::Real; select = nothing)
         end
         return Int[r]
     end
-    nds0, pos0 = _load_located(p, fa, anchor, choose0; select = select)
+    nds0, pos0 = _load_located(p, fa, anchor, choose0; select = select, fetched = fetched)
     units = plan.clock.units
     t0 = _tick(plan, anchor)
     t1 = _tick(plan, nxt)
@@ -1097,7 +1131,7 @@ function _temporal_sample(p::Provider, t::Real; select = nothing)
                 0 <= r < len || throw(_NoSuccessor())
                 return Int[r]
             end
-            nds1, pos1 = _load_located(p, fa1, nxt, choose1; select = select)
+            nds1, pos1 = _load_located(p, fa1, nxt, choose1; select = select, fetched = fetched)
             (nds1, pos1[1])
         catch err
             err isa InterruptException && rethrow()
@@ -1156,17 +1190,36 @@ OVERRIDES any baked `reader_kwargs[:select]` for this call only, letting a calle
 provider. Any reader that answers [`supports_selection`] can honour it — the
 `zarr` reader by fetching only the intersecting chunk objects, the `netcdf` one by
 materialising only the requested hyperslab of the blob it already fetched;
-passing `select` to a reader that cannot is an `ArgumentError`."""
+passing `select` to a reader that cannot is an `ArgumentError`.
+
+**The result is shared: treat it as read-only.** A provider with a `time_dim`
+over a whole-file reader keeps the last sample it returned, keyed by the record
+`t` falls in (the cadence tick, or a `temporal` provider's record anchor), the
+effective `select` (per-call, else baked — a named-dimension window included) and
+the identity of every source blob the sample decodes (path, inode, size and
+mtime, from `stat`). The same key again returns that very `NativeDataset` — the
+same dicts, fields and arrays — without reading anything, so a caller that
+modifies one must copy it first. Any change of key reads afresh: another record
+(forward or backward), another `select`, or a blob that was re-fetched, rewritten
+or touched. A blob modified within the last 2 s is not kept, because a filesystem
+with whole-second mtimes cannot yet tell its next rewrite apart (git's
+racy-timestamp rule). `EARTHSCIIO_PROVIDER_CACHE=0` (or `false`/`no`/`off`) turns
+this off; it is read on every call."""
 function materialize(p::Provider, t::Real; select = nothing)
-    p.plan === nothing || return _temporal_sample(p, t; select = select)
+    _memo_applies(p) && return _memoized(p, t, select)
+    return _materialize(p, t; select = select)
+end
+
+function _materialize(p::Provider, t::Real; select = nothing, fetched = nothing)
+    p.plan === nothing || return _temporal_sample(p, t; select = select, fetched = fetched)
     if p.records_per_sample == 2 && p.time_dim !== nothing
-        return _bracket(p, t; select = select)
+        return _bracket(p, t; select = select, fetched = fetched)
     end
     if p.time_dim !== nothing
         tick = _tick_index(p, t)
         # The TICK's file (see `_bracket`), and — where the reader takes a
         # `records` pushdown — only the tick's record out of it.
-        nds, pos = _load_ticks(p, Int[tick]; select = select)
+        nds, pos = _load_ticks(p, Int[tick]; select = select, fetched = fetched)
         return _slice_dim(nds, p.time_dim, pos[1])
     end
     # A DISCRETE source with one file per tick resolves its URL at the TICK too,
@@ -1177,6 +1230,98 @@ function materialize(p::Provider, t::Real; select = nothing)
     # `time_dim`. A CONST source has no ticks and reads its one URL.
     p.cadence == DISCRETE && return _load(p, p.times[_tick_index(p, t)]; select = select)
     return _load(p, t; select = select)
+end
+
+# --- last-sample memo -------------------------------------------------------
+# A model samples every provider at every forcing boundary, but a provider's data
+# changes only when the boundary crosses one of ITS records. Measured on
+# reseact.esm (CONUS 4x5, one day, 18 GEOS-FP providers, 32 boundaries a day):
+# 632 samples, each opening and decoding its daily file, 22.9 s of forcing a day;
+# returning the previous sample whenever the record has not moved leaves 300
+# reads and 9.2 s, bit-identical. Re-reading only the successor record when the
+# record does move was measured too and saves nothing — the cost is per open,
+# not per record — so the memo holds exactly the last sample and nothing else.
+#
+# The key is the RECORD rather than `t` — the cadence tick of a provider built
+# from `times`, the record anchor of a `temporal` one, which is all `t` reaches a
+# sample through — so every `t` in one record's interval hits, and it works in
+# either time direction (an adjoint replays the forcing backwards). With it go
+# the plan of a `temporal` provider (its cadence and the time origin the bracket's
+# time coordinate counts from; the run window chooses `refresh_times` and
+# prefetch, never a sample), the effective `select` (a named-dimension window
+# included), the reader, and the bytes of the blobs. Every other input
+# (`variables`, `records_per_sample`, the rest of `reader_kwargs`) is fixed when
+# the provider is built, and a provider made from another (`with_window`) gets a
+# memo of its own. The blobs are still resolved through `fetch_blob` on every
+# call, so TTL expiry and the `file://` recheck decide what the bytes are exactly
+# as they always did, and a blob they replace has a new identity.
+#
+# Store-backed readers are excluded: a zarr sample is many objects, not one blob
+# with one identity.
+_memo_applies(p::Provider) =
+    p.time_dim !== nothing && !store_backed(_reader_for(p)) && _provider_cache_enabled()
+
+# On unless an explicit denial, the spelling `EARTHSCI_REVALIDATE_FILE` takes.
+function _provider_cache_enabled()
+    v = lowercase(strip(get(ENV, "EARTHSCIIO_PROVIDER_CACHE", "")))
+    return !(v in ("0", "false", "no", "off"))
+end
+
+# The record `t` reaches a sample through, raising what the sample raises for a
+# `t` before the first one: the cadence tick's INDEX for a provider built from
+# `times` (two ticks may share a time but not a file record), the record anchor
+# for a `temporal` one.
+_memo_record(p::Provider, t::Real) =
+    p.plan === nothing ? _tick_index(p, t) : _temporal_anchor(p, t)
+
+# The part of a `temporal` provider's plan a sample is computed from.
+_memo_plan(p::Provider) = p.plan === nothing ? nothing :
+    ((p.plan::_TemporalPlan).temporal, (p.plan::_TemporalPlan).clock)
+
+function _memoized(p::Provider, t::Real, select)
+    rec = _memo_record(p, t)
+    # The blobs the sample decodes (`_sample_url_times`: the record's file, and a
+    # bracket successor's), fetched as the read would fetch them. A failed fetch
+    # is kept and raised again by the read, where a `temporal` bracket holds its
+    # floor record when the successor's file cannot be read; that sample, with
+    # no identity for the blob, is not kept.
+    fetched = Dict{String, Any}()
+    idents = Any[]
+    for ut in _sample_url_times(p, t)
+        u = String(p.url_for(ut))
+        haskey(fetched, u) && continue
+        got = try
+            _fetch_at(p, ut)
+        catch err
+            err isa InterruptException && rethrow()
+            err
+        end
+        fetched[u] = got
+        push!(idents, got isa CacheEntry ? _file_identity(got.path) : nothing)
+    end
+    effective = select === nothing ? get(p.reader_kwargs, :select, nothing) : select
+    key = (rec, _memo_plan(p), effective, _reader_for(p), idents)
+    m = p.memo
+    hit = lock(m.lock) do
+        m.value !== nothing && isequal(m.key, key) ? m.value : nothing
+    end
+    hit === nothing || return hit
+    # The read runs outside the lock, so concurrent samples of one provider (a
+    # `PrefetchGroup`'s workers) are not serialised; each call stores the key it
+    # computed with the sample it read, so a key is never paired with another
+    # call's sample.
+    nds = _materialize(p, t; select = select, fetched = fetched)
+    lock(m.lock) do
+        if any(isnothing, idents)                # a blob that cannot vouch for itself
+            m.key, m.value = nothing, nothing
+        else
+            # A copy of `select`, so a caller that reuses and edits its Dict
+            # cannot edit the key behind the memo's back.
+            m.key = (rec, _memo_plan(p), deepcopy(effective), _reader_for(p), idents)
+            m.value = nds
+        end
+    end
+    return nds
 end
 
 function materialize(p::Provider; select = nothing)
@@ -1211,11 +1356,13 @@ The no-argument form is a [`CONST`] provider's [`materialize`]`(p)`.
 It is safe to call from several threads at once on one provider, which is what
 [`PrefetchGroup`] does. In the Python and Rust tracks `sample_at` is new because
 their `refresh` updates a decoded-file buffer; the Julia [`Provider`] holds no
-buffer at all (immutable, decoding per sample with its `records` pushdown), so
-here it is the same function as [`materialize`], under the name the cross-track
-contract gives it. The shared state it does touch is thread-safe: the cache takes
-a per-blob lock to fill a miss, and every NetCDF-C access is serialised by one
-process-wide lock."""
+file buffer (it decodes per sample with its `records` pushdown), so here it is
+the same function as [`materialize`], under the name the cross-track contract
+gives it — and so returns the same shared, read-only dataset as `materialize`
+for a repeated record. The shared state it does touch is thread-safe: the cache
+takes a per-blob lock to fill a miss, the last-sample memo takes its own lock
+only to look up and to store (never across a read), and every NetCDF-C access is
+serialised by one process-wide lock."""
 sample_at(p::Provider, t::Real) = materialize(p, t)
 sample_at(p::Provider) = materialize(p)
 

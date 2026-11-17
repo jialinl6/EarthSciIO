@@ -4,6 +4,20 @@ All three language tracks (Rust `earthsciio` on crates.io, Python `earthsciio`
 on PyPI, Julia `EarthSciIO` in General) ship under one version number. The
 package version is independent of the `.esm` format version.
 
+## Unreleased
+
+### Julia
+
+- **perf:** a Provider with a `time_dim` (every `temporal` provider has one)
+  keeps its last sample and returns it unread while the record (the cadence
+  tick, or a `temporal` provider's record anchor), the effective `select` (a
+  named-dimension window included) and the source blobs (path, inode, size,
+  mtime) are unchanged, in either time direction. Measured on a CONUS 4x5 day
+  with 18 GEOS-FP providers: 632 file reads become 300, and forcing drops from
+  22.9 s to 9.2 s, bit-identical. The returned dataset is shared, so treat it as
+  read-only. A blob modified within the last 2 s is not kept. On by default;
+  `EARTHSCIIO_PROVIDER_CACHE=0` turns it off.
+
 ## v0.4.0
 
 Changes since v0.3.0. A minor bump because of the **breaking** change below:
